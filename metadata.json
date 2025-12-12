@@ -1,0 +1,7 @@
+{
+  "name": "DynEd Interactive Engine",
+  "description": "An interactive English learning application following the 5-Step Study Method with human-like AI voice.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
