@@ -24,10 +24,11 @@ export interface Message {
   id: string;
   type: MessageType;
   sender: Sender;
-  content: string; // Text content or base64 audio string
+  content: string; // Text content or base64 audio string (can be empty if fallback text is used)
   isPlaying?: boolean; // For UI state of audio messages
   label?: string; // Optional label for audio messages
   autoPlay?: boolean; // Automatically play audio when message appears
+  textForSpeech?: string; // FALLBACK: If API fails, use this text with browser TTS
 }
 
 export interface LearningState {

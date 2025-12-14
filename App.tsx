@@ -40,6 +40,30 @@ const App: React.FC = () => {
     setMessages(prev => [...prev, { ...msg, id: Date.now().toString() + Math.random() }]);
   };
 
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+  // Logic to re-generate audio for a specific message (Manual Retry)
+  const handleRetryAudio = async (messageId: string, text: string) => {
+      try {
+          const audioData = await generateSpeech(text);
+          if (audioData) {
+              setMessages(prev => prev.map(msg => {
+                  if (msg.id === messageId) {
+                      return {
+                          ...msg,
+                          content: audioData, 
+                          textForSpeech: undefined, 
+                          label: msg.label?.replace(" (Backup)", "")
+                      };
+                  }
+                  return msg;
+              }));
+          }
+      } catch (error: any) {
+          console.warn("Manual retry failed:", error.message);
+      }
+  };
+
   const processInput = async () => {
     if (!input.trim()) return;
 
@@ -50,6 +74,51 @@ const App: React.FC = () => {
     await runStepLogic(userText);
   };
 
+  // Helper to chunk sentences
+  const splitIntoChunks = (text: string, minWords: number = 10): string[] => {
+    const rawSegments = text.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g)?.map(s => s.trim()) || [text];
+    
+    const chunkedSentences: string[] = [];
+    let currentBuffer = "";
+
+    for (const segment of rawSegments) {
+        const combined = currentBuffer ? `${currentBuffer} ${segment}` : segment;
+        const wordCount = combined.split(/\s+/).length;
+
+        if (wordCount >= minWords) {
+            chunkedSentences.push(combined);
+            currentBuffer = "";
+        } else {
+            currentBuffer = combined;
+        }
+    }
+    if (currentBuffer) chunkedSentences.push(currentBuffer);
+    return chunkedSentences.length > 0 ? chunkedSentences : [text];
+  };
+
+  // Safe Audio Generator: Returns base64 OR null (which triggers backup voice)
+  const generateAudioWithFallback = async (text: string): Promise<string | null> => {
+    let attempts = 0;
+    const maxAttempts = 2; // Fewer retries to not keep user waiting too long
+    
+    while (attempts < maxAttempts) {
+        try {
+            return await generateSpeech(text);
+        } catch (err: any) {
+            if (err.message === "QUOTA_EXCEEDED") {
+                attempts++;
+                if (attempts < maxAttempts) {
+                    await sleep(1500); // Short wait
+                    continue;
+                }
+            }
+            break; 
+        }
+    }
+    // Return null means "Quota/Error - Use Backup Voice"
+    return null; 
+  };
+
   // The State Machine Engine
   const runStepLogic = async (userInput: string) => {
     setIsLoading(true);
@@ -57,8 +126,7 @@ const App: React.FC = () => {
     try {
       // STATE 0: INIT -> STATE 1
       if (learningState.step === AppStep.INITIALIZATION) {
-        // Simple heuristic to split sentences: periods, exclamation, question marks followed by space
-        const sentences = userInput.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g)?.map(s => s.trim()) || [userInput];
+        const sentences = splitIntoChunks(userInput, 10);
         
         setLearningState(prev => ({
           ...prev,
@@ -71,21 +139,21 @@ const App: React.FC = () => {
         addMessage({ type: MessageType.SYSTEM, sender: Sender.BOT, content: "--- 1. Get the Gist (泛听) ---" });
         
         // Generate Audio for full text
-        const audioData = await generateSpeech(userInput);
-        if (audioData) {
-          addMessage({ 
+        const audioData = await generateAudioWithFallback(userInput);
+        
+        addMessage({ 
             type: MessageType.AUDIO, 
             sender: Sender.BOT, 
-            content: audioData,
+            content: audioData || "", // Empty if fallback
+            textForSpeech: audioData ? undefined : userInput, // Trigger Backup Voice if no audio
             autoPlay: true,
-            label: "Full Story"
-          });
-        }
+            label: audioData ? "Full Story (HD)" : "Full Story (Backup)"
+        });
         
         addMessage({ 
           type: MessageType.TEXT, 
           sender: Sender.BOT, 
-          content: "🎧 Please listen to the full text above. Do not read detailedly yet.\n\nQuestion: After listening, please tell me in one sentence: What is the main idea?" 
+          content: `🎧 Full text loaded. I have grouped it into ${sentences.length} learning segments.\n\nQuestion: After listening, please tell me in one sentence: What is the main idea?` 
         });
       }
 
@@ -94,26 +162,22 @@ const App: React.FC = () => {
         const feedback = await getEducationalFeedback('correct_summary', learningState.rawScript, userInput);
         addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: feedback });
         
-        // Transition to Step 2
         setLearningState(prev => ({ ...prev, step: AppStep.LISTEN_UNDERSTAND, currentSentenceIndex: 0 }));
         
         addMessage({ type: MessageType.SYSTEM, sender: Sender.BOT, content: "--- 2. Listen & Understand (精听) ---" });
-        await startSentenceLoop(0); // Pass index 0 explicitly
+        await startSentenceLoop(0); 
       }
 
       // STATE 2: UNDERSTAND LOOP
       else if (learningState.step === AppStep.LISTEN_UNDERSTAND) {
         const currentSentence = learningState.sentences[learningState.currentSentenceIndex];
 
-        // Process commands for current sentence
         if (userInput.toLowerCase() === 'yes' || userInput.toLowerCase() === 'y') {
-            // Next sentence
             const nextIndex = learningState.currentSentenceIndex + 1;
             if (nextIndex < learningState.sentences.length) {
                 setLearningState(prev => ({ ...prev, currentSentenceIndex: nextIndex }));
                 await startSentenceLoop(nextIndex);
             } else {
-                // Done with Step 2, move to Step 3
                 setLearningState(prev => ({ ...prev, step: AppStep.LISTEN_SPEAK, currentSentenceIndex: 0 }));
                 addMessage({ type: MessageType.SYSTEM, sender: Sender.BOT, content: "--- 3. Listen & Speak (跟读/Shadowing) ---" });
                 await startShadowingLoop(0);
@@ -137,7 +201,6 @@ const App: React.FC = () => {
                  setLearningState(prev => ({ ...prev, currentSentenceIndex: nextIndex }));
                  await startShadowingLoop(nextIndex);
              } else {
-                 // Done with Step 3, move to Step 4
                  setLearningState(prev => ({ ...prev, step: AppStep.RECORD_COMPARE, currentSentenceIndex: 0 }));
                  addMessage({ type: MessageType.SYSTEM, sender: Sender.BOT, content: "--- 4. Record & Compare (录音对比) ---" });
                  await startRecordLoop(0);
@@ -149,7 +212,6 @@ const App: React.FC = () => {
 
       // STATE 4: RECORD LOOP
       else if (learningState.step === AppStep.RECORD_COMPARE) {
-         // User gives self reflection for the current sentence
          addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "Great reflection. Moving to next sentence." });
          
          const nextIndex = learningState.currentSentenceIndex + 1;
@@ -157,7 +219,6 @@ const App: React.FC = () => {
             setLearningState(prev => ({ ...prev, currentSentenceIndex: nextIndex }));
             await startRecordLoop(nextIndex);
          } else {
-             // Move to Step 5
              setLearningState(prev => ({ ...prev, step: AppStep.SUMMARIZE_PERSONALIZE }));
              addMessage({ type: MessageType.SYSTEM, sender: Sender.BOT, content: "--- 5. Summarize & Personalize (活用) ---" });
              
@@ -172,11 +233,9 @@ const App: React.FC = () => {
       // STATE 5: SUMMARIZE -> PERSONALIZE
       else if (learningState.step === AppStep.SUMMARIZE_PERSONALIZE) {
           if (!learningState.grammarStructure) {
-              // We just got the summary, correct it, then ask for personalization
               const feedback = await getEducationalFeedback('correct_summary', learningState.rawScript, userInput);
               addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: feedback });
 
-              // Prepare Part B
               const structure = await extractGrammarPoint(learningState.rawScript);
               setLearningState(prev => ({ ...prev, grammarStructure: structure }));
               
@@ -186,12 +245,10 @@ const App: React.FC = () => {
                   content: `Step 5 Part B: Personalize.\n\nGrammar Focus: **${structure}**\n\nTask: Use this structure to describe a fact about YOUR own life, family, or studies.` 
               });
           } else {
-              // We got the personalization sentence
               const feedback = await getEducationalFeedback('check_structure', learningState.grammarStructure, userInput);
               addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: feedback });
               addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "🎉 Excellent work! You have completed the DynEd 5-Step Cycle for this text. Paste a new text to start again." });
               
-              // Reset
               setLearningState({
                   step: AppStep.INITIALIZATION,
                   rawScript: '',
@@ -201,9 +258,10 @@ const App: React.FC = () => {
           }
       }
 
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "An error occurred interacting with the engine." });
+      const errorMessage = err.message || "An error occurred interacting with the engine.";
+      addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `🔴 ${errorMessage}` });
     } finally {
       setIsLoading(false);
     }
@@ -212,36 +270,35 @@ const App: React.FC = () => {
   // Helper: Step 2 Loop Display
   const startSentenceLoop = async (index: number) => {
     const sentence = learningState.sentences[index];
-    addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `Sentence ${index + 1}/${learningState.sentences.length}:\n\n**"${sentence}"**` });
+    addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `Segment ${index + 1}/${learningState.sentences.length}:\n\n**"${sentence}"**` });
     
-    // Generate Audio for the specific sentence
-    const audioData = await generateSpeech(sentence);
-    if (audioData) {
-        addMessage({ 
-          type: MessageType.AUDIO, 
-          sender: Sender.BOT, 
-          content: audioData, 
-          autoPlay: true 
-        });
-    }
+    const audioData = await generateAudioWithFallback(sentence);
+    addMessage({ 
+        type: MessageType.AUDIO, 
+        sender: Sender.BOT, 
+        content: audioData || "",
+        textForSpeech: audioData ? undefined : sentence,
+        autoPlay: true,
+        label: audioData ? "Teacher (HD)" : "Teacher (Backup)"
+    });
 
-    addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "Do you understand this sentence? (Yes / Hint / Explain)" });
+    addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "Do you understand this segment? (Yes / Hint / Explain)" });
   };
 
   // Helper: Step 3 Loop Display (With Audio)
   const startShadowingLoop = async (index: number) => {
     const sentence = learningState.sentences[index];
-    addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `Shadowing ${index + 1}/${learningState.sentences.length}:\n\n**"${sentence}"**` });
+    addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `Shadowing Segment ${index + 1}/${learningState.sentences.length}:\n\n**"${sentence}"**` });
     
-    const audioData = await generateSpeech(sentence);
-    if (audioData) {
-        addMessage({ 
-          type: MessageType.AUDIO, 
-          sender: Sender.BOT, 
-          content: audioData, 
-          autoPlay: true 
-        });
-    }
+    const audioData = await generateAudioWithFallback(sentence);
+    addMessage({ 
+        type: MessageType.AUDIO, 
+        sender: Sender.BOT, 
+        content: audioData || "",
+        textForSpeech: audioData ? undefined : sentence,
+        autoPlay: true,
+        label: audioData ? "Teacher (HD)" : "Teacher (Backup)"
+    });
     
     addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "🗣️ Listen, then Speak. Repeat 3 times. Type '/next' when done." });
   };
@@ -250,21 +307,21 @@ const App: React.FC = () => {
   const startRecordLoop = async (index: number) => {
       const sentence = learningState.sentences[index];
       
-      addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `Recording ${index + 1}/${learningState.sentences.length}:\n\n**"${sentence}"**` });
+      addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: `Recording Segment ${index + 1}/${learningState.sentences.length}:\n\n**"${sentence}"**` });
       
-      // Generate TTS for it
-      const audioData = await generateSpeech(sentence);
-      if (audioData) {
-        addMessage({ type: MessageType.AUDIO, sender: Sender.BOT, content: audioData, label: "Model Audio", autoPlay: false });
-      }
-
-      // The UI will detect we are in RECORD_COMPARE and render the recorder
+      const audioData = await generateAudioWithFallback(sentence);
+      addMessage({ 
+          type: MessageType.AUDIO, 
+          sender: Sender.BOT, 
+          content: audioData || "",
+          textForSpeech: audioData ? undefined : sentence,
+          autoPlay: false,
+          label: audioData ? "Model Audio (HD)" : "Model Audio (Backup)"
+      });
   };
 
   const handleQuickReply = (text: string) => {
       setInput(text);
-      // Optional: auto-submit could be enabled here
-      // processInput(); 
   };
 
   return (
@@ -313,6 +370,8 @@ const App: React.FC = () => {
                      <AudioPlayer 
                         base64Audio={msg.sender === Sender.BOT ? msg.content : undefined} 
                         audioUrl={msg.sender === Sender.USER ? msg.content : undefined}
+                        textToSpeak={msg.textForSpeech} // Ensure fallback text is passed
+                        onRetry={msg.textForSpeech ? () => handleRetryAudio(msg.id, msg.textForSpeech!) : undefined}
                         label={msg.label || (msg.sender === Sender.BOT ? "Teacher" : "You")} 
                         autoPlay={msg.autoPlay}
                      />
@@ -323,7 +382,6 @@ const App: React.FC = () => {
           </div>
         ))}
         
-        {/* Contextual UI for Step 4: Show Recorder when bot last spoke and didn't ask for reflection yet */}
         {learningState.step === AppStep.RECORD_COMPARE && 
          messages.length > 0 && 
          messages[messages.length-1].sender === Sender.BOT && 
@@ -333,9 +391,7 @@ const App: React.FC = () => {
                     key={learningState.currentSentenceIndex}
                     onRecordingComplete={(blob) => {
                      const url = URL.createObjectURL(blob);
-                     // Add User Audio Bubble so they can listen
                      addMessage({ type: MessageType.AUDIO, sender: Sender.USER, content: url });
-                     // Add Prompt for reflection
                      addMessage({ type: MessageType.TEXT, sender: Sender.BOT, content: "Self-Evaluation: On a scale of 1-10, how close was your intonation? Type your reflection." });
                 }} />
             </div>
@@ -358,7 +414,6 @@ const App: React.FC = () => {
       {/* Input Area */}
       <div className="bg-white border-t border-slate-200 p-4">
         
-        {/* Quick Actions based on Step */}
         {learningState.step === AppStep.LISTEN_UNDERSTAND && !isLoading && (
             <div className="flex space-x-2 mb-3 justify-center">
                 <button onClick={() => handleQuickReply('Yes')} className="px-5 py-2 bg-green-50 text-green-700 border border-green-200 rounded-full text-sm font-medium hover:bg-green-100 transition-colors">Yes</button>
